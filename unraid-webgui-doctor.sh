@@ -1,14 +1,45 @@
 #!/bin/bash
 # Unraid WebGUI diagnosis and explicitly confirmed component repairs.
+# Copyright (C) 2026 Jason Froebe
 # SPDX-License-Identifier: GPL-3.0-only
+#
+# This program is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the
+# Free Software Foundation, version 3.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. See the LICENSE file in this repository.
+# If not, see <https://www.gnu.org/licenses/>.
+#
+# Diagnose first, correlate observations, then offer narrowly scoped repairs.
+# A process existing is not proof of service health; likewise, an HTTP failure
+# alone is not proof that restarting PHP-FPM is the right remedy.
+#
+# Privacy is based on omission: raw configuration, process arguments and logs
+# are used locally where needed, but only selected scalars and interpretations
+# reach console/report output. Never trace this script with bash -x when sharing
+# output, because shell tracing bypasses that reporting boundary.
 set -euo pipefail
 (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 2) )) \
   || { >&2 printf 'Requires Bash 5.2 or newer.\n'; exit 2; }
 shopt -s inherit_errexit nullglob
+# Use fixed system directories before invoking external programs so an inherited
+# PATH cannot select a same-named tool from a writable working directory.
+# A stable locale also makes command-output parsing less dependent on host settings.
 declare -rx PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 declare -rx LC_ALL=C
 declare -r VERSION=1.0.0 SCRIPT_NAME=unraid-webgui-doctor.sh
+# Live paths are rooted at the actual host. The test suite instruments a private
+# copy of this constant; there is deliberately no runtime fixture-root override.
 declare -r SYSTEM_ROOT=''
+# Keep configuration flags separate from observations. Observation variables are
+# refreshed by component checks and later correlated before repairs are offered.
+# ROWS holds structured findings; ACTIONS contains only currently eligible repairs.
 declare -i VERBOSE=1 EXPANDED=0 REPORT=0 NO_REPAIR=0 INTERACTIVE=0 RESULT=0
 declare -i NGINX=0 PHP=0 EMHTTP=0 CONFIG_OK=0 HTTP_OK=0 HTTP_BAD=0
 declare -i NGINX_MASTER=0 NGINX_WORKERS=0 HTTP_BACKEND=0
@@ -19,12 +50,16 @@ declare -- CONFIG_FILE='' SNI_HOST=localhost
 declare -a ROWS=() PORTS=() SCHEMES=() ACTIONS=()
 declare -A SEEN_PORTS=()
 
+# Operational messages use stderr so stdout remains usable for help, version,
+# and report-path data. Quiet mode suppresses information, not warnings or errors.
 _msg() { >&2 printf '%s: %s\n' "$SCRIPT_NAME" "$*"; }
 info() { ((VERBOSE)) || return 0; _msg "$@"; }
 warn() { _msg "WARNING: $*"; }
 error() { _msg "ERROR: $*"; }
 die() { error "${@:2}"; exit "$1"; }
 
+# Help/version paths run before host and privilege checks, allowing the interface
+# to be inspected without root access or a functioning Unraid installation.
 show_help() {
   cat <<'HELP'
 Unraid WebGUI Doctor — diagnose first, confirm before repair.
@@ -52,6 +87,9 @@ Unknown checks are explicitly reported; exit 0 is not full qualification.
 HELP
 }
 
+# WORK_DIR can contain raw sensitive captures. Remove it on normal or trapped
+# exits, preserving the caller-visible status instead of hiding a failed diagnosis.
+# Reports live outside this scratch directory and intentionally survive cleanup.
 cleanup() {
   local -i status=$1
   trap - EXIT INT TERM
@@ -61,6 +99,9 @@ cleanup() {
   exit "$status"
 }
 
+# Stop scheduling additional checks or repairs after an interrupt. Already written
+# report rows provide a partial audit; this does not undo an approved service action.
+# A shell trap may wait for a foreground command to return before it can execute.
 interrupted() {
   local -i status=$1
   # A second signal forces termination even if cleanup is delayed by storage.
@@ -70,6 +111,10 @@ interrupted() {
   exit "$status"
 }
 
+# One reporting boundary serves both human interpretation and TSV records.
+# Callers must supply fixed descriptions or validated scalars, never raw log lines,
+# command output or configuration. FAILED changes the assessment exit status;
+# WARNING and UNKNOWN remain visible without pretending to prove a failure.
 finding() {
   local -- component=$1 status=$2 severity=$3 evidence=$4 cause=$5 confidence=$6 next=$7 repair=$8
   local -- stamp='' row=''
@@ -88,8 +133,13 @@ finding() {
   return 0
 }
 
+# Optional tools are discovered at their point of use. Diagnosis never installs
+# packages or depends on downloading a recovery tool while the WebGUI is down.
 has_tool() { command -v "$1" &>/dev/null; }
 
+# Exact process-name matching avoids treating an unrelated command containing a
+# service name as evidence of health. A failed inventory is UNKNOWN, not zero:
+# confusing an unavailable measurement with an absent service could justify a bad repair.
 process_count() {
   local -- name=$1 text=''
   if text=$(ps -eo comm= 2>/dev/null); then
@@ -99,6 +149,11 @@ process_count() {
   fi
 }
 
+# Reporting is opt-in for diagnosis and mandatory before an approved repair.
+# A private directory and unpredictable filename reduce accidental disclosure and
+# unsafe reuse of a pre-existing path. Refuse symlink/ownership surprises rather
+# than changing permissions on a directory controlled by another user.
+# Only generated reports are pruned; arbitrary files in the parent are untouched.
 prepare_report() {
   local -- directory='' old='' owner=''
   local -a reports=()
@@ -129,6 +184,10 @@ prepare_report() {
   return 0
 }
 
+# Resource pressure can mimic broken services: exhausted log space, inodes or
+# memory may prevent workers from starting or replying. Observe before restarting.
+# Parse only numeric version/resource fields so identifiers from system output
+# cannot accidentally enter a public diagnostic report. Thresholds are heuristics.
 system_checks() {
   local -- version='' kernel='' uptime='' memory='' path='' capacity='' inodes=''
   if [[ -r $SYSTEM_ROOT/etc/unraid-version ]]; then
@@ -184,6 +243,9 @@ system_checks() {
   return 0
 }
 
+# Track nginx, PHP-FPM and management-daemon observations independently. Missing
+# management processes require version-specific investigation, not an assumed
+# restart command. Presence is deliberately described as a limited observation.
 check_processes() {
   local -- component='' count=''
   NGINX=0 PHP=0 EMHTTP=0
@@ -216,6 +278,10 @@ check_processes() {
   return 0
 }
 
+# Master/worker titles provide more context than a single service PID, but their
+# format is implementation-dependent. Compare simple pool limits with observed
+# workers only as a saturation clue: this cannot distinguish busy from idle workers
+# or establish which request, plugin or backend caused a delay.
 worker_checks() {
   local -- inventory='' counts='' php_master='' php_workers='' config='' maximum=''
   inventory=$(ps -eo args= 2>/dev/null) || {
@@ -252,6 +318,9 @@ worker_checks() {
   return 0
 }
 
+# Executable versions help explain layout differences. Keep only a recognized
+# numeric version; discard vendor banners and other output that may identify a host.
+# Bounds prevent a broken executable from indefinitely blocking basic diagnosis.
 component_versions() {
   local -- component='' output='' number=''
   for component in nginx php-fpm; do
@@ -271,6 +340,11 @@ component_versions() {
   return 0
 }
 
+# The effective nginx configuration is more reliable than assuming ports 80/443
+# or guessing include files. nginx -T also tests referenced configuration resources.
+# Keep its raw output private, then extract a bounded set of numeric listeners,
+# one suitable Host/SNI name and one simple FastCGI Unix socket. Unsupported layouts
+# stay explicit limitations rather than prompting guessed repair commands.
 nginx_config() {
   local -- line='' port='' scheme='' host='' socket='' socket_mode=''
   local -a endpoints=()
@@ -337,6 +411,11 @@ nginx_config() {
   return 0
 }
 
+# Separate TCP-listener evidence from HTTP behavior. A bound port may not serve
+# the management application, and loopback may fail when binding excludes loopback.
+# Force every request to loopback even when Host/SNI uses a discovered name. Do not
+# follow redirects: a redirect can be normal authentication/TLS behavior, and its
+# destination must not turn a local diagnostic probe into an external request.
 probe_endpoints() {
   local -- response='' code='' elapsed='' port='' scheme='' listeners='' value=''
   local -i index=0 status=0 available=0
@@ -358,8 +437,12 @@ probe_endpoints() {
     finding listener UNKNOWN info "$scheme port=$port observed_tcp_listener=$available" \
       'Listener ownership and interface restrictions require correlation' low 'Compare local HTTP result' no
     # --resolve prevents DNS or external traffic. Never follow redirects or use a proxy.
+    # Ignore curl startup configuration; it could otherwise inject credentials,
+    # proxy settings or transfer behavior before the explicit probe flags apply.
     args=(--disable --noproxy '*' --silent --output /dev/null --connect-timeout 2 --max-time 6
       --resolve "$SNI_HOST:$port:127.0.0.1" --write-out '%{http_code} %{time_total}')
+    # Certificate trust is deliberately not tested here. This exception is safe
+    # only within the forced-loopback probe; it is never used for internet traffic.
     if [[ $scheme == https ]]; then args+=(--insecure); fi
     status=0
     response=$(curl "${args[@]}" "$scheme://$SNI_HOST:$port/" 2>/dev/null) || status=$?
@@ -405,6 +488,10 @@ probe_endpoints() {
   return 0
 }
 
+# Bound log work and report classifications instead of message contents, since
+# even ordinary error lines can contain URLs, tokens, paths or user information.
+# Timestamp correlation distinguishes recent patterns from stale evidence. Formats
+# that cannot be dated are uncorrelated; they must not establish a current outage.
 log_checks() {
   local -- path='' label='' data='' counts=''
   local -i found=0 recent=0 unknown=0
@@ -447,6 +534,10 @@ log_checks() {
   return 0
 }
 
+# Updaters may legitimately wait on child processes, network I/O or a package lock.
+# Combine elapsed time with a short metadata/I/O sample, retaining only safe process
+# identifiers and wait-state fields. An unchanged sample is not proof of a hang;
+# descendants can still make progress. This function never sends process signals.
 plugin_checks() {
   local -- table='' row='' pid='' parent='' elapsed='' state='' wait_channel='' command=''
   local -- before='' after='' cpu='' io=''
@@ -502,6 +593,11 @@ plugin_checks() {
   return 0
 }
 
+# Restrict automation to known component paths and candidate version families.
+# Require an executable regular helper, root ownership, no group/other write access,
+# and an explicit operation label in its dispatch. These are eligibility checks,
+# not a complete audit of customized helper behavior or live release qualification.
+# No management-daemon or arbitrary user-supplied helper is dispatched here.
 service_safe() {
   local -- component=$1 operation=$2 service='' owner='' mode='' content=''
   case $component in
@@ -522,6 +618,11 @@ service_safe() {
   return 0
 }
 
+# Build recommendations from combinations of observations, not isolated symptoms.
+# Rebuild ACTIONS each time so old eligibility cannot survive a fresh diagnosis.
+# Resource pressure or an unavailable process inventory blocks service changes.
+# A PHP restart needs an absent PHP process plus nginx/backend-error evidence;
+# nginx reload needs a master without observed workers, not merely an HTTP error.
 correlate() {
   ACTIONS=()
   if ((HTTP_BAD && ! PHP && NGINX)); then
@@ -559,6 +660,9 @@ correlate() {
   return 0
 }
 
+# Run sequentially to avoid adding parallel load to an already degraded host.
+# Discovery precedes probes; raw observations precede interpretation and repair
+# eligibility. This same sequence supports independent post-repair verification.
 diagnose() {
   system_checks
   check_processes
@@ -572,6 +676,11 @@ diagnose() {
   return 0
 }
 
+# Diagnosis-only/report modes take precedence over an interactive request. A real
+# terminal, a numbered selection and a separate exact YES are all required.
+# Snapshot the offered actions for selection, but revalidate after confirmation:
+# the service, configuration or resource situation may change while the user reads.
+# One approved action is attempted; failures never trigger cascading restarts.
 repair_menu() {
   local -- selection='' answer='' action='' component='' operation='' service=''
   local -i index=0 status=0 permitted=0 lock_fd=0
@@ -601,6 +710,8 @@ repair_menu() {
   service=$SYSTEM_ROOT/run/unraid-webgui-doctor.lock
   [[ ! -L $service && (! -e $service || -f $service) ]] || die 13 'Unsafe repair lock path.'
   exec {lock_fd}> "$service" || die 5 'Cannot open repair lock.'
+  # Serialize repair attempts requested through this utility, without waiting behind
+  # another attempt. The lock does not prevent independent administrator actions.
   flock -n "$lock_fd" || die 1 'Another WebGUI Doctor repair is in progress.'
   # Revalidate after the user confirms: service state/config may have changed while waiting.
   RESULT=0 RESOURCE_BAD=0
@@ -623,6 +734,8 @@ repair_menu() {
     'Explicit terminal confirmation and fresh diagnosis completed' high 'Wait for post-repair verification' no
   # A clean environment prevents inherited interpreter/loader/proxy settings affecting service control.
   status=0
+  # Bound helper execution and capture its output privately. A timeout can leave
+  # an operation incomplete; do not retry blindly or infer recovery from exit alone.
   timeout --foreground -k 5 30 env -i PATH="$PATH" LC_ALL=C /bin/bash "$service" "$operation" \
     > "$WORK_DIR/repair-output" 2>&1 || status=$?
   if ((status)); then
@@ -633,6 +746,8 @@ repair_menu() {
   sleep 2
   RESULT=0 RESOURCE_BAD=0
   diagnose
+  # Require observed HTTP recovery and no remaining FAILED assessment. A helper
+  # returning success by itself does not prove that the application is usable.
   if ((HTTP_OK && HTTP_BAD == 0 && RESULT == 0)); then
     finding repair HEALTHY info "$action completed; post-repair local checks passed" \
       'Observed local recovery; browser behavior unverified' medium 'Confirm WebGUI access manually' no
@@ -643,6 +758,9 @@ repair_menu() {
   return 0
 }
 
+# Parse options before acquiring resources. Freeze configuration after parsing
+# so later diagnostics cannot silently switch operating modes or reporting policy.
+# Install cleanup/signal traps before creating any sensitive scratch captures.
 main() {
   local -- tool='' mode=auto
   umask 077
