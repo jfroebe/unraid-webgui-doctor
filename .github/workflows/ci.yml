@@ -1,0 +1,54 @@
+name: Validate
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: validate-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  static-and-mocks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install validation dependencies
+        shell: python
+        run: |
+          import subprocess
+          subprocess.run(['sudo', 'apt-get', 'update', '-qq'], check=True)
+          subprocess.run(['sudo', 'apt-get', 'install', '-y', 'shellcheck'], check=True)
+      - name: Syntax, ShellCheck, deterministic standards and public-file checks
+        shell: python
+        run: |
+          import subprocess
+          subprocess.run(['python3', 'tests/validate.py'], check=True)
+      - name: Isolated diagnostic and repair tests
+        shell: python
+        run: |
+          import subprocess
+          subprocess.run(['python3', '-m', 'unittest', 'discover', '-s', 'tests', '-v'], check=True)
+  upstream-bcs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Retrieve pinned upstream BCS tooling
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: Open-Technology-Foundation/bash-coding-standard
+          ref: 4098bc5d4e6c7ffd6dab8b2d00206fed3f9ecdec
+          path: .bcs
+      - name: Full upstream BCS audit (required; missing backend fails)
+        shell: python
+        env:
+          OPENAI_API_KEY: ${{ secrets.BCS_OPENAI_API_KEY }}
+        run: |
+          import os
+          import subprocess
+          if not os.environ.get('OPENAI_API_KEY'):
+              raise SystemExit('BCS_OPENAI_API_KEY is required for the upstream LLM-based audit; release blocked.')
+          subprocess.run(['bash', '.bcs/bcs', 'check', '-m', 'gpt5', '-e', 'high',
+                          '--strict', 'unraid-webgui-doctor.sh'], check=True)
