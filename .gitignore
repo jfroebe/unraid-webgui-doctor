@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.bcs/
+*.tsv
+*.log
+*.partial
